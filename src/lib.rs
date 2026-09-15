@@ -192,11 +192,25 @@ impl ConfigManager {
         let loader = ConfigLoader::new(format);
         let data = loader.load_file(path)?;
 
+        // A non-object used to fall through this match to `Ok(())`, applying
+        // nothing while reporting success — so a config file that rendered to
+        // a bare scalar left the service on defaults with no error to explain
+        // it. The loaders reject that shape now: `parse_json` guards it
+        // directly, `parse_toml` goes through `toml::Value`, whose root is
+        // always a table, and `parse_env` builds a `Map` unconditionally — so
+        // this arm is unreachable by construction and cannot be provoked by a
+        // test today. It is kept anyway because it states the guarantee at the
+        // point where the keys are actually applied, so a loader added later
+        // cannot reintroduce the silent-success path.
+        let serde_json::Value::Object(map) = data else {
+            return Err(ConfigError::ParseError(format!(
+                "expected a top-level object in {path}, found a value carrying no keys"
+            )));
+        };
+
         let mut config = self.config.write().unwrap();
-        if let serde_json::Value::Object(map) = data {
-            for (key, value) in map {
-                config.insert(key, value);
-            }
+        for (key, value) in map {
+            config.insert(key, value);
         }
 
         Ok(())
@@ -632,6 +646,28 @@ mod tests {
             n,
             name
         ))
+    }
+
+    /// Loading a file that carries no keys must fail rather than report
+    /// success. The old code matched the object case and fell through to
+    /// `Ok(())`, so a config rendered to a bare scalar — the usual shape of a
+    /// templating mistake — started the service on defaults silently.
+    #[test]
+    fn loading_a_file_with_no_top_level_object_is_an_error() {
+        let path = unique_temp_path("scalar.json");
+        std::fs::write(&path, "[1, 2, 3]").unwrap();
+
+        let manager = ConfigManager::new();
+        let result = manager.load_file(path.to_str().unwrap(), FileFormat::Json);
+
+        assert!(
+            result.is_err(),
+            "a config file carrying no keys loaded successfully"
+        );
+        // And nothing was applied, so the failure is not a partial load.
+        assert!(manager.get_string("anything").is_err());
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
